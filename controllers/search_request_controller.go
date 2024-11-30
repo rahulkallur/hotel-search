@@ -57,10 +57,20 @@ func initProducer() sarama.SyncProducer {
 
 	// Split broker URLs into a slice (in case there are multiple brokers)
 	brokers := strings.Split(brokerURL, ",")
+	fmt.Println(brokers)
 
 	// Configure Sarama
 	config := sarama.NewConfig()
+	config.Producer.Return.Errors = true
 	config.Producer.Return.Successes = true
+	config.Net.SASL.Enable = true
+
+	sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
+
+	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
+	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
+	config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+	config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 
 	// Create a new producer
 	producer, err := sarama.NewSyncProducer(brokers, config)
@@ -210,9 +220,17 @@ func StartConsumer() {
 
 	currentTime := time.Now().UnixNano() / int64(time.Millisecond)
 	consumerGrp := "search-hotel-consumer" + strconv.FormatInt(currentTime, 10)
+	config := sarama.NewConfig()
+	config.Producer.Return.Errors = true
+	config.Producer.Return.Successes = true
+	config.Net.SASL.Enable = true
+	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
+	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
+	config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+	config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 
 	// Create Kafka consumer group
-	consumerGroup, err := sarama.NewConsumerGroup(brokers, consumerGrp, nil)
+	consumerGroup, err := sarama.NewConsumerGroup(brokers, consumerGrp, config)
 	if err != nil {
 		log.Fatalf("Failed to create consumer group: %v", err)
 	}
