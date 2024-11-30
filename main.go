@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"Search/controllers"
@@ -15,9 +16,10 @@ import (
 )
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
+	if os.Getenv("ENV") == "development" {
+		if err := godotenv.Load(); err != nil {
+			log.Println("Error loading .env file, but it's not required in production.")
+		}
 	}
 	e1 := gin.New()
 	configCors := cors.DefaultConfig()

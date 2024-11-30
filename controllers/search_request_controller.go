@@ -41,10 +41,13 @@ func NewSearchRequestController(repo services.SearchRepository) SearchRequestCon
 }
 
 func initProducer() sarama.SyncProducer {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
+	if os.Getenv("ENV") == "development" {
+		if err := godotenv.Load(); err != nil {
+			log.Println("Error loading .env file, but it's not required in production.")
+		}
 	}
+
+	fmt.Println(os.Getenv("KAFKA_BROKER_URL"))
 	// Read broker URL(s) from an environment variable
 	brokerURL := os.Getenv("KAFKA_BROKER_URL")
 	if brokerURL == "" {
