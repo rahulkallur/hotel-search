@@ -42,12 +42,13 @@ func NewSearchRequestController(repo services.SearchRepository) SearchRequestCon
 
 func initProducer() sarama.SyncProducer {
 	if os.Getenv("ENV") == "development" {
-		if err := godotenv.Load(); err != nil {
-			log.Println("Error loading .env file, but it's not required in production.")
+		err := godotenv.Load()
+		if err != nil {
+			log.Printf("Error loading .env file: %v", err)
+		} else {
+			log.Println("Successfully loaded .env file")
 		}
 	}
-
-	fmt.Println(os.Getenv("KAFKA_BROKER_URL"))
 	// Read broker URL(s) from an environment variable
 	brokerURL := os.Getenv("KAFKA_BROKER_URL")
 	if brokerURL == "" {
@@ -60,14 +61,9 @@ func initProducer() sarama.SyncProducer {
 	// Configure Sarama
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
-	config.Net.SASL.Enable = true
-	config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
-	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
 
 	// Create a new producer
 	producer, err := sarama.NewSyncProducer(brokers, config)
-	fmt.Println(err.Error())
 	if err != nil {
 		log.Fatalf("Failed to create Kafka producer: %v", err)
 	}

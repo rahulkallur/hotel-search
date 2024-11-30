@@ -17,8 +17,11 @@ import (
 
 func main() {
 	if os.Getenv("ENV") == "development" {
-		if err := godotenv.Load(); err != nil {
-			log.Println("Error loading .env file, but it's not required in production.")
+		err := godotenv.Load()
+		if err != nil {
+			log.Printf("Error loading .env file: %v", err)
+		} else {
+			log.Println("Successfully loaded .env file")
 		}
 	}
 	e1 := gin.New()
