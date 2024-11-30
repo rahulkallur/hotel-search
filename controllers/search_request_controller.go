@@ -60,6 +60,9 @@ func initProducer() sarama.SyncProducer {
 	// Configure Sarama
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
+	config.Net.SASL.Enable = true
+	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
+	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
 
 	// Create a new producer
 	producer, err := sarama.NewSyncProducer(brokers, config)
