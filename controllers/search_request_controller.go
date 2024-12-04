@@ -22,9 +22,16 @@ import (
 
 var (
 	producer      sarama.SyncProducer
-	listeners     = make(map[string]chan interface{})
+	listeners     = make(map[string]*listenerData)
 	listenersLock sync.Mutex
 )
+
+type listenerData struct {
+	counter    int
+	batchCount int
+	responses  []map[string]interface{}
+	responseCh chan interface{}
+}
 
 type SearchRequestController interface {
 	SearchRequestMapper(ctx *gin.Context)
@@ -63,14 +70,14 @@ func initProducer() sarama.SyncProducer {
 	config := sarama.NewConfig()
 	config.Producer.Return.Errors = true
 	config.Producer.Return.Successes = true
-	config.Net.SASL.Enable = true
+	// config.Net.SASL.Enable = true
 
 	sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 
-	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
-	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
-	config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
-	config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+	// config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
+	// config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
+	// config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+	// config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 
 	// Create a new producer
 	producer, err := sarama.NewSyncProducer(brokers, config)
@@ -127,7 +134,12 @@ func (c *searchRequestcontroller) SearchRequestMapper(ctx *gin.Context) {
 	// Create a channel for the listener
 	responseChan := make(chan interface{}) // Buffered channel
 	listenersLock.Lock()
-	listeners[correlationID] = responseChan
+	listeners[correlationID] = &listenerData{
+		counter:    0,
+		batchCount: 0, // Will be updated with the number of batches
+		responses:  []map[string]interface{}{},
+		responseCh: responseChan,
+	}
 	listenersLock.Unlock()
 
 	defer func() {
@@ -138,23 +150,51 @@ func (c *searchRequestcontroller) SearchRequestMapper(ctx *gin.Context) {
 		// log.Printf("Listener removed for correlationId: %s", correlationID)
 	}()
 
-	// Pass the mapped request to the repository for further processing.
-	request := c.repo.SearchRequestMapper(rq)
-	// log.Printf("Search request: %s", request)
-
-	requestData := map[string]string{
-		"data":          request,
-		"correlationId": correlationID,
-	}
-
-	payload, _ := json.Marshal(requestData)
-
-	// Publish the message
-	err := publishMessage(os.Getenv("PUBLISH_TOPIC"), correlationID, payload)
-	if err != nil {
+	hotelCodes := extractHotelCodes(rq)
+	if hotelCodes == nil {
+		log.Printf("Hotel codes missing or invalid")
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
+
+	batchSizeStr := os.Getenv("BATCH_SIZE")
+
+	// Convert the string to an integer
+	batchSize, err := strconv.Atoi(batchSizeStr)
+	if err != nil {
+		fmt.Println("Error converting BATCH_SIZE:", err)
+		return
+	}
+
+	batches := splitHotelCodesIntoBatches(hotelCodes, batchSize)
+
+	listenersLock.Lock()
+	listeners[correlationID].batchCount = len(batches)
+	listenersLock.Unlock()
+
+	fmt.Println("Number of batches:", len(batches))
+	for _, batch := range batches {
+		rq.HotelCode = strings.Join(batch, ",")
+		request := c.repo.SearchRequestMapper(rq)
+
+		fmt.Println("Request Mapper for correlationId: %s", request)
+		// log.Printf("Search request: %s", request)
+
+		requestData := map[string]string{
+			"data":          request,
+			"correlationId": correlationID,
+		}
+
+		payload, _ := json.Marshal(requestData)
+
+		// Publish the message
+		err := publishMessage(os.Getenv("PUBLISH_TOPIC"), correlationID, payload)
+		if err != nil {
+			ctx.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+	}
+	// Pass the mapped request to the repository for further processing.
 
 	// Wait for a response
 	response, err := waitForResponse(correlationID)
@@ -170,6 +210,23 @@ func (c *searchRequestcontroller) SearchRequestMapper(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, response)
 }
 
+func extractHotelCodes(rq model.HotelSearchRequest) []string {
+	// Assuming the hotel codes are part of the 'rq' struct as a comma-separated string
+	return strings.Split(rq.HotelCode, ",")
+}
+
+func splitHotelCodesIntoBatches(hotelCodes []string, batchSize int) [][]string {
+	var batches [][]string
+	for i := 0; i < len(hotelCodes); i += batchSize {
+		end := i + batchSize
+		if end > len(hotelCodes) {
+			end = len(hotelCodes)
+		}
+		batches = append(batches, hotelCodes[i:end])
+	}
+	return batches
+}
+
 func shutdownProducer() {
 	if producer != nil {
 		_ = producer.Close()
@@ -177,39 +234,36 @@ func shutdownProducer() {
 }
 
 func waitForResponse(correlationID string) (map[string]interface{}, error) {
-	// log.Printf("Waiting for response for correlationId: %s", correlationID)
-
-	// Start listening for responses only once
-
-	// Create a new response channel for the current correlationId
-	responseChan := make(chan interface{})
-
-	// log.Printf("Response channel created for correlationId: %s", correlationID)
-
-	// Register the listener for the current correlationId
 	listenersLock.Lock()
-	listeners[correlationID] = responseChan
+	listener, exists := listeners[correlationID]
 	listenersLock.Unlock()
 
-	defer func() {
-		// Clean up the listener when done
-		listenersLock.Lock()
-		delete(listeners, correlationID)
-		listenersLock.Unlock()
-		log.Printf("Listener removed for correlationId: %s", correlationID)
-	}()
+	if !exists {
+		return nil, fmt.Errorf("no listener found for correlationId: %s", correlationID)
+	}
 
-	// Wait for response or timeout (30 seconds)
-	select {
-	case response := <-responseChan:
-		if parsedResponse, ok := response.(map[string]interface{}); ok {
-			// log.Printf("Received parsed response for correlationId: %s", correlationID)
-			return parsedResponse, nil
+	for {
+		listenersLock.Lock()
+		if listener.counter == listener.batchCount {
+			// All batches processed, merge only the hotel_listing
+			mergedResponse := make(map[string]interface{})
+			var mergedHotelListings []interface{} // For merging hotel listings
+
+			for _, resp := range listener.responses {
+				if hotelListing, ok := resp["hotel_listing"]; ok {
+					mergedHotelListings = append(mergedHotelListings, hotelListing)
+				}
+			}
+			// Merge the hotel listings into the mergedResponse map
+			mergedResponse["hotel_listing"] = mergedHotelListings
+
+			listenersLock.Unlock()
+			return mergedResponse, nil
 		}
-		return nil, fmt.Errorf("unexpected response type")
-	case <-time.After(30 * time.Second):
-		log.Printf("Timeout waiting for response for correlationId: %s", correlationID)
-		return nil, fmt.Errorf("timeout waiting for response")
+		listenersLock.Unlock()
+
+		// Wait for response for a short period
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -223,11 +277,11 @@ func StartConsumer() {
 	config := sarama.NewConfig()
 	config.Producer.Return.Errors = true
 	config.Producer.Return.Successes = true
-	config.Net.SASL.Enable = true
-	config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
-	config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
-	config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
-	config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+	// config.Net.SASL.Enable = true
+	// config.Net.SASL.User = os.Getenv("KAFKA_USERNAME")
+	// config.Net.SASL.Password = os.Getenv("KAFKA_PASSWORD")
+	// config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+	// config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 
 	// Create Kafka consumer group
 	consumerGroup, err := sarama.NewConsumerGroup(brokers, consumerGrp, config)
@@ -274,10 +328,7 @@ func (consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error   { retur
 func (consumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
 func (h consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for message := range claim.Messages() {
-		// log.Printf("Message received: key=%s, value=%s, topic=%s", string(message.Key), string(message.Value), message.Topic)
-
 		messageData := string(message.Value)
-		// Unmarshal the response data
 		var responseData map[string]interface{}
 		err := json.Unmarshal([]byte(messageData), &responseData)
 		if err != nil {
@@ -285,40 +336,34 @@ func (h consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, 
 			continue
 		}
 
-		// Combine hotel_listing and tracker_id
-		responseObject := map[string]interface{}{
-			"tracker_id":    responseData["tracker_id"],
-			"hotel_listing": responseData["hotel_listing"],
-		}
-
-		// fmt.Println("Response data: ", responseObject)
+		// Extract hotel_listing from the response data
+		hotelListing := responseData["hotel_listing"]
 
 		correlationID := string(message.Key)
-		// log.Printf("Checking listener map for correlationId: %s", correlationID)
 
 		// Check if a listener exists for the given correlationId
 		listenersLock.Lock()
-		responseChan, exists := listeners[correlationID]
-		listenersLock.Unlock()
-
+		listener, exists := listeners[correlationID]
 		if exists {
-			// log.Printf("Found listener for correlationId: %s", correlationID)
+			// Append the hotel_listing to the listener's responses
+			// Only store the hotel_listing in the response
+			listener.responses = append(listener.responses, map[string]interface{}{
+				"hotel_listing": hotelListing,
+			})
+			listener.counter++
 
-			// responseJSON, err := json.Marshal(responseObject)
-			// if err != nil {
-			// 	log.Printf("Failed to marshal response object: %v", err)
-			// 	continue
-			// }
-			// Send the response to the listener's channel
-			select {
-			case responseChan <- responseObject:
-				// log.Printf("Response sent to listener for correlationId: %s", correlationID)
-			default:
-				// log.Printf("Listener for correlationId %s is not ready to receive data", correlationID)
+			// fmt.Println("Listener counter: ", listener.responses)
+
+			// If all batches are processed, send the response to the channel
+			if listener.counter == listener.batchCount {
+				select {
+				case listener.responseCh <- listener.responses:
+				default:
+					log.Printf("Listener channel for correlationId %s is not ready", correlationID)
+				}
 			}
-		} else {
-			log.Printf("No listener found for correlationId: %s", correlationID)
 		}
+		listenersLock.Unlock()
 
 		// Mark the message as processed
 		session.MarkMessage(message, "")
